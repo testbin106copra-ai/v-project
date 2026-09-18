@@ -44,9 +44,10 @@ PORT             = int(os.environ.get("CHECKER_PORT", os.environ.get("PORT", "67
 REQUEST_TIMEOUT  = 90
 MEMORY_LIMIT_PCT = 90
 
-logging.basicConfig(level=logging.INFO, format="%(message)s",
+logging.basicConfig(level=logging.CRITICAL, format="%(message)s",
                     handlers=[logging.StreamHandler()])
 _log = logging.getLogger("main")
+_log.setLevel(logging.CRITICAL)
 
 # ══════════════════════════════════════════════════════════════
 #  Dead-site cache
