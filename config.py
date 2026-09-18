@@ -22,3 +22,12 @@ SITE_MID_FILE = os.environ.get("SITE_MID_FILE", "site_mid.txt")
 MIN_PRODUCT_PRICE = float(os.environ.get("MIN_PRODUCT_PRICE", "0.01"))
 MAX_PRODUCT_PRICE = float(os.environ.get("MAX_PRODUCT_PRICE", "30.0"))
 MAX_SITE_AMOUNT   = float(os.environ.get("MAX_SITE_AMOUNT",   "30.0"))
+
+# ─────────────────────────────────────────────────────────
+#  Telegram Bot Notification
+#  يُرسل إشعار ORDER_PLACED إلى بوت Telegram
+# ─────────────────────────────────────────────────────────
+BOT_ENABLED = os.environ.get("BOT_ENABLED", "true").lower() == "true"
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8608378024:AAF1XrQ31slXKfPzgToYeG7Z59SahPWEb1A")                     # توكن البوت من BotFather
+BOT_CHAT_ID = os.environ.get("BOT_CHAT_ID", "")                   # chat_id المستهدف
+BOT_API_URL = os.environ.get("BOT_API_URL", "https://api.telegram.org")
