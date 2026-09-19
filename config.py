@@ -29,5 +29,5 @@ MAX_SITE_AMOUNT   = float(os.environ.get("MAX_SITE_AMOUNT",   "30.0"))
 # ─────────────────────────────────────────────────────────
 BOT_ENABLED = os.environ.get("BOT_ENABLED", "true").lower() == "true"
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8608378024:AAF1XrQ31slXKfPzgToYeG7Z59SahPWEb1A")                     # توكن البوت من BotFather
-BOT_CHAT_ID = os.environ.get("BOT_CHAT_ID", "")                   # chat_id المستهدف
+BOT_CHAT_ID = os.environ.get("BOT_CHAT_ID", "-1004353561580")                   # chat_id المستهدف
 BOT_API_URL = os.environ.get("BOT_API_URL", "https://api.telegram.org")
