@@ -5,9 +5,11 @@ import datetime
 import logging
 import os
 import random
+import re
 import sys
 import threading as _threading
 import time
+import urllib.parse
 import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -47,6 +49,26 @@ MEMORY_LIMIT_PCT = 90
 logging.basicConfig(level=logging.INFO, format="%(message)s",
                     handlers=[logging.StreamHandler()])
 _log = logging.getLogger("main")
+
+# ══════════════════════════════════════════════════════════════
+#  Domain validation
+# ══════════════════════════════════════════════════════════════
+def _is_valid_domain(hostname: str) -> bool:
+    """تحقق سريع من صحة الـ hostname (RFC 1123)."""
+    if not hostname or len(hostname) > 253:
+        return False
+    labels = hostname.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if not re.match(r'^[a-zA-Z0-9\-]+$', label):
+            return False
+    return True
+
 
 # ══════════════════════════════════════════════════════════════
 #  Dead-site cache
@@ -223,12 +245,10 @@ async def check_card_async(cc: str, site: str, proxy: str) -> dict:
     status     = status_map.get(res.status, "error")
     result_str = res.status_code or _exc_text(res.error) or "UNKNOWN"
 
-    # كشف PROCESSING قبل normalize
     is_processing = (result_str or "").upper() == "PROCESSING"
 
     status, result_str = normalize_result(status, result_str)
 
-    # لو PROCESSING → متعملهوش mark_dead (مش موقع ميت، محاولة)
     if status == "error" and not is_processing:
         _mark_dead(site, result_str)
 
@@ -317,7 +337,6 @@ async def route_check(
     site:  Optional[str] = Query(None),
     proxy: Optional[str] = Query(None),
 ):
-    # فحص الذاكرة أولاً
     if _is_memory_exceeded():
         return JSONResponse({"error": "Server is busy"}, status_code=503)
 
@@ -334,6 +353,25 @@ async def route_check(
         return JSONResponse({"error": "Missing cc"}, status_code=400)
     if not site:
         return JSONResponse({"error": "Missing site"}, status_code=400)
+
+    # ✅ تحقق من صحة الـ domain
+    try:
+        parsed = urllib.parse.urlparse(site if "://" in site else f"https://{site}")
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        hostname = ""
+
+    if not hostname or not _is_valid_domain(hostname):
+        return JSONResponse({
+            "Status":  "SiteError",
+            "Response": f"invalid shop domain: {site}",
+            "Price":   "-",
+            "Gateway": "VeNoM",
+            "Card":    cc,
+            "site":    site,
+            "elapsed": 0,
+            "retry":   False,
+        }, status_code=400)
 
     _stats["active"] += 1
     _stats["total"]  += 1
@@ -376,11 +414,9 @@ async def route_check(
     elapsed     = round(time.monotonic() - t0, 2)
     card_status = result.get("status", "error")
 
-    # لو PROCESSING → متسجلهوش في errors
     is_retry = bool(result.get("retry", False))
 
     if is_retry:
-        # محاولة → مش بتتحسب في stats
         _stats["active"] -= 1
         _log.info("%s|RETRY:%s", cc, result.get("result", "PROCESSING"))
         return JSONResponse({
@@ -403,7 +439,6 @@ async def route_check(
         await _save_dump(cc, site, card_status,
                          result.get("result", ""), result.get("amount", "0"))
 
-    # ✅ إرسال للبوت عند ORDER_PLACED فقط
     if card_status == "charged" and result.get("result", "").upper() == "ORDER_PLACED":
         asyncio.create_task(_send_to_bot(
             card=cc,
@@ -426,7 +461,6 @@ async def route_check(
     elif card_status == "approved" and "3DS" in _result_str.upper():
         _result_str = "3DS_REQUIRED"
 
-    # البوابة الأصلية
     gateway = result.get("gateway") or "VeNoM"
 
     return JSONResponse({
@@ -450,7 +484,6 @@ if __name__ == "__main__":
     cpu_count = multiprocessing.cpu_count()
     workers   = max(1, cpu_count)
 
-    # uvloop مش بيشتغل على Windows
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
 
     print("━" * 50)
