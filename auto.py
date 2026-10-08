@@ -198,6 +198,33 @@ def get_fallback_addresses(exclude_country: str = "US") -> List[Address]:
             result.append(COUNTRY_ADDRESSES[code])
     return result
 
+
+# ──────────────────────── Domain validation ──────────────────────────
+
+def _is_valid_shopify_domain(hostname: str) -> bool:
+    """
+    بيتأكد إن الـ hostname صالح:
+    - مفيهوش شرطة في الأول أو الآخر للـ label
+    - كل label فيه حروف/أرقام/شرطات بس (RFC 1123)
+    - طول الـ label ≤ 63
+    """
+    if not hostname or len(hostname) > 253:
+        return False
+    labels = hostname.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label:
+            return False
+        if len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if not re.match(r'^[a-zA-Z0-9\-]+$', label):
+            return False
+    return True
+
+
 # ──────────────────────── TLS Client ─────────────────────────────────
 
 class TLSClient:
@@ -351,7 +378,6 @@ def find_cheapest_product(client: TLSClient, shop_url: str,
 
     - بيستخدم products.json أو /collections/all/products.json
     - sitemap اتحذف لأنها مش بتجيب variant_id حقيقي
-      (الـ cart permalink محتاج variant_id حقيقي)
     """
     now = time.time()
     cache_key = (shop_url, min_price, max_price)
@@ -391,7 +417,11 @@ def find_cheapest_product(client: TLSClient, shop_url: str,
 
     if not all_products:
         if last_error:
-            raise Exception(f"all product-fetch methods failed: {last_error}")
+            # نظّف رسالة الخطأ من "See https://curl.se/..."
+            err_txt = str(last_error)
+            err_txt = re.sub(r'\.?\s*See https?://\S+\s*first for more details\.?', '', err_txt)
+            err_txt = re.sub(r'\s+', ' ', err_txt).strip()
+            raise Exception(f"all product-fetch methods failed: {err_txt}")
         raise Exception(f"no products found at {shop_url}")
 
     best = _best_entry(all_products, min_price, max_price)
@@ -465,11 +495,32 @@ def fetch_private_access_token(client: TLSClient, shop_url: str, checkout_url: s
     return f"[{resp.status_code}] {resp.text}"
 
 
-# ──────────────────────── Step 3: actions JS ─────────────────────────
+# ──────────────────────── Step 3: checkout JS files ──────────────────
+
+def extract_all_checkout_js_urls(checkout_html: str, shop_url: str) -> List[str]:
+    """
+    يجيب كل ملفات JS في checkout-web/assets/ — بدل ملف actions واحد.
+    Shopify بيغيّر أسماء الملفات كل فترة، فبنجرّب كلهم.
+    """
+    if not checkout_html:
+        return []
+    matches = re.findall(
+        r'(/cdn/shopifycloud/checkout-web/assets/[A-Za-z0-9_\-/]+\.[A-Za-z0-9_\-]+\.js)',
+        checkout_html
+    )
+    seen, urls = set(), []
+    for m in matches:
+        if m not in seen:
+            seen.add(m)
+            urls.append(shop_url + m)
+    return urls
+
 
 def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
-    match = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
-    return shop_url + match.group(1) if match else ""
+    """alias للتوافق — يرجّع أول ملف JS"""
+    urls = extract_all_checkout_js_urls(checkout_html, shop_url)
+    return urls[0] if urls else ""
+
 
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
@@ -477,39 +528,58 @@ def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
         "accept-language": "en-US,en;q=0.9",
         "origin": shop_url,
         "priority": "u=1",
+        "referer": shop_url + "/",
         "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
         "sec-fetch-dest": "script",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+        "user-agent": client.user_agent,
     }
     resp = client.get(actions_url, headers=headers)
     if resp.status_code != 200:
-        raise Exception(f"GET actions JS returned {resp.status_code}")
+        raise Exception(f"GET js returned {resp.status_code}")
     return resp.text
 
+
+def extract_ids_from_js(js_body: str) -> Tuple[str, str, str]:
+    """
+    يرجّع (proposal_id, submit_id, poll_id) من أي ملف JS.
+    poll_id ممكن يكون فاضي — بنستخدم fallback.
+    """
+    if not js_body:
+        return "", "", ""
+    pid = sid = poll = ""
+    m = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js_body)
+    if m:
+        pid = m.group(1)
+    m = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js_body)
+    if m:
+        sid = m.group(1)
+    for pat in [
+        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"',
+        r'name:\s*"PollForReceipt"[^}]{0,300}?id:\s*"([a-f0-9]{64})"',
+        r'PollForReceipt.{0,300}?([a-f0-9]{64})',
+    ]:
+        m = re.search(pat, js_body)
+        if m:
+            poll = m.group(1)
+            break
+    return pid, sid, poll
+
+
 def extract_proposal_id(js_body: str) -> str:
-    match = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js_body)
-    return match.group(1) if match else ""
+    pid, _, _ = extract_ids_from_js(js_body)
+    return pid
 
 def extract_submit_for_completion_id(js_body: str) -> str:
-    match = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js_body)
-    return match.group(1) if match else ""
+    _, sid, _ = extract_ids_from_js(js_body)
+    return sid
 
 def extract_poll_for_receipt_id(js_body: str) -> str:
-    patterns = [
-        r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"',
-        r'name:\s*"PollForReceipt"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
-        r'"PollForReceipt"[^}]{0,200}id:\s*"([a-f0-9]{64})"',
-        r'PollForReceipt.{0,300}?([a-f0-9]{64})',
-    ]
-    for p in patterns:
-        match = re.search(p, js_body)
-        if match:
-            return match.group(1)
-    return ""
+    _, _, poll = extract_ids_from_js(js_body)
+    return poll
 
 
 # ──────────────────────── Extraction helpers ─────────────────────────
@@ -554,7 +624,6 @@ def extract_pci_session_id(pci_body: str) -> str:
     return match.group(1) if match else ""
 
 
-# ✅ extract_delivery_handle — 11 طريقة
 def extract_delivery_handle(proposal_body: str) -> str:
     patterns = [
         r'"selectedDeliveryStrategy"\s*:\s*\{\s*"handle"\s*:\s*"([^"]+)"\s*,\s*"__typename"\s*:\s*"CompleteDeliveryStrategy"',
@@ -1540,6 +1609,18 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
     result.site_name = site_name
     result.currency  = currency
 
+    # ✅ تحقق من صحة الـ domain
+    try:
+        parsed = urllib.parse.urlparse(shop_url if "://" in shop_url else f"https://{shop_url}")
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        hostname = ""
+
+    if not hostname or not _is_valid_shopify_domain(hostname):
+        result.retryable = False
+        result.error = Exception(f"invalid shop domain: {shop_url}")
+        return result
+
     try:
         try:
             title, product_id, product_handle, variant_id, price = find_cheapest_product(
@@ -1574,16 +1655,27 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ✅ Step 3: جرّب كل ملفات JS
         try:
-            actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body     = fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id   = extract_submit_for_completion_id(js_body)
+            js_urls = extract_all_checkout_js_urls(checkout_html, shop_url)
+            if not js_urls:
+                raise Exception("no checkout JS URLs found in HTML")
+
+            proposal_id = submit_id = poll_for_receipt_id = ""
+            for js_url in js_urls:
+                try:
+                    js_body = fetch_actions_js(client, js_url, shop_url)
+                    pid, sid, poll = extract_ids_from_js(js_body)
+                    if pid and sid:
+                        proposal_id = pid
+                        submit_id = sid
+                        poll_for_receipt_id = poll or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+                        break
+                except Exception:
+                    continue
+
             if not proposal_id or not submit_id:
-                raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+                raise Exception(f"no Proposal/Submit IDs found in {len(js_urls)} JS files")
         except Exception as e:
             result.retryable = True
             result.error = Exception(f"Step 3 failed: {e}")
@@ -1970,6 +2062,18 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
         status=CheckStatus.ERROR
     )
 
+    # ✅ تحقق من صحة الـ domain
+    try:
+        parsed = urllib.parse.urlparse(shop_url if "://" in shop_url else f"https://{shop_url}")
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        hostname = ""
+
+    if not hostname or not _is_valid_shopify_domain(hostname):
+        result.retryable = False
+        result.error = Exception(f"invalid shop domain: {shop_url}")
+        return result
+
     try:
         card_number, card_month, card_year, card_cvv = parse_card_entry(card_entry)
     except Exception as e:
@@ -2019,16 +2123,27 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ✅ Step 3: جرّب كل ملفات JS
         try:
-            actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body = fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id = extract_submit_for_completion_id(js_body)
+            js_urls = extract_all_checkout_js_urls(checkout_html, shop_url)
+            if not js_urls:
+                raise Exception("no checkout JS URLs found in HTML")
+
+            proposal_id = submit_id = poll_for_receipt_id = ""
+            for js_url in js_urls:
+                try:
+                    js_body = fetch_actions_js(client, js_url, shop_url)
+                    pid, sid, poll = extract_ids_from_js(js_body)
+                    if pid and sid:
+                        proposal_id = pid
+                        submit_id = sid
+                        poll_for_receipt_id = poll or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+                        break
+                except Exception:
+                    continue
+
             if not proposal_id or not submit_id:
-                raise Exception("missing Proposal or Submit ID")
-            poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+                raise Exception(f"no Proposal/Submit IDs found in {len(js_urls)} JS files")
         except Exception as e:
             result.status = CheckStatus.ERROR
             result.retryable = True
@@ -2307,15 +2422,32 @@ def load_sites_from_file(path: Path) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
     sites = []
+    seen = set()
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         if not line.startswith(("http://", "https://")):
             line = "https://" + line
-        sites.append(line.rstrip("/"))
+        line = line.rstrip("/")
+
+        # استخرج hostname و تحقق منه
+        try:
+            parsed = urllib.parse.urlparse(line)
+            hostname = (parsed.hostname or "").lower()
+        except Exception:
+            continue
+
+        if not _is_valid_shopify_domain(hostname):
+            continue
+
+        if line in seen:
+            continue
+        seen.add(line)
+        sites.append(line)
+
     if not sites:
-        raise Exception("site.txt is empty — add at least one Shopify URL")
+        raise Exception("site.txt is empty (or all URLs were invalid) — add at least one valid Shopify URL")
     return sites
 
 
