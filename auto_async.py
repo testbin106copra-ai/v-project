@@ -158,13 +158,45 @@ async def _fetch_products_page(client: AsyncTLSClient, shop_url: str, page: int 
         raise Exception("products.json invalid JSON")
 
 
-def _best_entry(products: list, min_price: float,
-                max_price: float = MAX_PRODUCT_PRICE) -> tuple | None:
-    best: tuple | None = None
+async def _fetch_products_from_collections(client: AsyncTLSClient, shop_url: str) -> list:
+    """
+    بديل products.json — /collections/all/products.json
+    مهم جداً: بيرجع variant IDs حقيقية.
+    """
+    for path in (
+        "/collections/all/products.json?sort_by=price-ascending&limit=250",
+        "/collections/frontpage/products.json?sort_by=price-ascending&limit=250",
+    ):
+        try:
+            resp = await client.get(f"{shop_url}{path}")
+            if resp.status_code != 200:
+                continue
+            data = resp.json().get("products", [])
+            if data:
+                return data
+        except Exception:
+            continue
+    return []
+
+
+def _best_entry(products: list, min_price: float, max_price: float = MAX_PRODUCT_PRICE):
+    """
+    يرجع (title, product_id, handle, variant_id, price) لأرخص variant متاح.
+    بيتحقق من وجود product_id و handle و variant_id حقيقيين.
+    """
+    best = None
     best_price = float("inf")
     for p in products:
+        p_id     = p.get("id")
+        p_handle = p.get("handle", "")
+        p_title  = p.get("title", "")
+        if not p_id or not p_handle:
+            continue
         for v in p.get("variants", []):
             if not v.get("available", False):
+                continue
+            v_id = v.get("id")
+            if not v_id:
                 continue
             try:
                 price = float(v.get("price") or 0)
@@ -175,10 +207,10 @@ def _best_entry(products: list, min_price: float,
             if price < best_price:
                 best_price = price
                 best = (
-                    p.get("title", ""),
-                    str(p.get("id", "")),
-                    p.get("handle", ""),
-                    str(v.get("id", "")),
+                    p_title,
+                    str(p_id),
+                    p_handle,
+                    str(v_id),
                     v.get("price", ""),
                 )
     return best
@@ -193,6 +225,13 @@ MAX_PRODUCT_PAGES = 10
 async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
                                 min_price: float = MIN_PRODUCT_PRICE,
                                 max_price: float = MAX_PRODUCT_PRICE):
+    """
+    يرجع: (title, product_id, product_handle, variant_id, price)
+
+    - بيستخدم products.json أو /collections/all/products.json
+    - sitemap اتحذف لأنها مش بتجيب variant_id حقيقي
+      (الـ cart permalink محتاج variant_id حقيقي)
+    """
     import time as _t
     now = _t.time()
     cache_key = (shop_url, min_price, max_price)
@@ -203,31 +242,53 @@ async def find_cheapest_product(client: AsyncTLSClient, shop_url: str,
             return cached[:-1]
 
     all_products: list = []
-    for page in range(1, MAX_PRODUCT_PAGES + 1):
-        try:
-            products = await _fetch_products_page(client, shop_url, page)
-        except Exception:
-            if all_products:
+    last_error: Exception = None
+
+    # ── الطريقة 1: products.json ──
+    try:
+        for page in range(1, MAX_PRODUCT_PAGES + 1):
+            try:
+                products = await _fetch_products_page(client, shop_url, page)
+            except Exception as e:
+                if all_products:
+                    break
+                raise
+            if not products:
                 break
-            raise
-        if not products:
-            break
-        all_products.extend(products)
-        if len(products) < 250:
-            break
+            all_products.extend(products)
+            if len(products) < 250:
+                break
+    except Exception as e:
+        last_error = e
+
+    # ── الطريقة 2: /collections/all/products.json ──
+    if not all_products:
+        try:
+            col_products = await _fetch_products_from_collections(client, shop_url)
+            if col_products:
+                all_products.extend(col_products)
+        except Exception as e:
+            last_error = e
 
     if not all_products:
+        if last_error:
+            raise Exception(f"all product-fetch methods failed: {last_error}")
         raise Exception(f"products.json returned empty list at {shop_url}")
 
     best = _best_entry(all_products, min_price, max_price)
     if best:
         with _product_cache_lock:
-            _product_cache[cache_key] = best + (_t.time(),)
+            _product_cache[cache_key] = best + (_now_ts(),)
         return best
 
     raise Exception(
         f"no available products between ${min_price:.2f}-${max_price:.2f} at {shop_url}"
     )
+
+
+def _now_ts() -> float:
+    import time as _t
+    return _t.time()
 
 
 # ── Step 1: cart → checkout ───────────────────────────────────────────
@@ -249,7 +310,8 @@ _PAGE_HEADERS = {
 
 
 async def add_to_cart_and_checkout(client: AsyncTLSClient, shop_url: str,
-                                   variant_id: str, product_id: str, product_handle: str):
+                                   variant_id: str, product_id: str = "", product_handle: str = ""):
+    """product_id و product_handle مش مستخدمين في الـ URL — variant_id كافي."""
     cart_permalink = f"{shop_url}/cart/{variant_id}:1"
     checkout_resp  = await client.get(cart_permalink, allow_redirects=True, headers={
         **_PAGE_HEADERS,
