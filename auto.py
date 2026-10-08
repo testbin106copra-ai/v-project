@@ -482,8 +482,49 @@ def fetch_private_access_token(client: TLSClient, shop_url: str, checkout_url: s
 # ──────────────────────── Step 3: actions JS ─────────────────────────
 
 def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
-    match = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
-    return shop_url + match.group(1) if match else ""
+    """
+    استخراج رابط ملف الـ JS اللي فيه GraphQL operation IDs.
+    Shopify بيغيّر أسماء الملفات باستمرار، فبنجرب أنماط متعددة.
+    """
+    # 1) الأنماط المعتادة داخل checkout-web/assets/c1/
+    patterns = [
+        # النمط الأصلي (actions)
+        r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
+        # أي bundle داخل c1/ (index, checkout, main, ...)
+        r'(/cdn/shopifycloud/checkout-web/assets/c1/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.js)',
+        # أي ملف داخل checkout-web/assets/
+        r'(/cdn/shopifycloud/checkout-web/assets/[A-Za-z0-9_./-]+\.js)',
+        # أي ملف داخل /cdn/shopifycloud/
+        r'(/cdn/shopifycloud/[A-Za-z0-9_./-]+\.js)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, checkout_html)
+        if match:
+            candidate = match.group(1)
+            # تجاهل الملفات الصغيرة المشكوك فيها (زي الـ polyfills)
+            if any(skip in candidate.lower() for skip in (
+                "polyfill", "vendor", "runtime", "webpack",
+            )):
+                continue
+            if candidate.startswith("http"):
+                return candidate
+            return shop_url + candidate
+
+    # 2) خطة احتياطية: ابحث في كل <script src="..."> عن أي ملف فيه
+    #    checkout أو c1 أو shopifycloud
+    script_srcs = re.findall(r'<script[^>]+src="([^"]+\.js[^"]*)"', checkout_html)
+    for src in script_srcs:
+        low = src.lower()
+        if "checkout" in low or "c1" in low or "shopifycloud" in low:
+            if src.startswith("http"):
+                return src
+            if src.startswith("/"):
+                return shop_url + src
+            if src.startswith("//"):
+                return "https:" + src
+
+    return ""
 
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
